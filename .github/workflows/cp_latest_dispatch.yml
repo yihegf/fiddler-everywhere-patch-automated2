@@ -6,7 +6,7 @@ on:
       os-and-arch:
         description: 'Operating System And Architecture'
         required: true
-        default: '6.0.0'
+        default: 'Windows (x86_64)'
         type: choice
         options:
           - Windows (x86_64)
@@ -233,12 +233,24 @@ jobs:
       - name: List files in the msojocs/server directory
         run: Get-ChildItem -Path msojocs\server
 
+      - name: Validate server resources
+        run: |
+          foreach ($path in @(
+            "msojocs/server/index.js",
+            "msojocs/server/file/identity.getfiddler.com/oauth/token.json"
+          )) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Required server resource not found: $path"
+            }
+          }
+
       - name: Upload msojocs folder as an artifact
         uses: actions/upload-artifact@v7
         with:
           name: msojocs-patch
           path: msojocs/
           if-no-files-found: error
+          include-hidden-files: true
 
   download-fiddler-everywhere-windows:
     if: ${{ github.event.inputs.os-and-arch == 'Windows (x86_64)' }}
@@ -277,6 +289,7 @@ jobs:
           name: fe_app
           path: fe_app/
           if-no-files-found: error
+          include-hidden-files: true
 
   download-fiddler-everywhere-linux:
     if: ${{ github.event.inputs.os-and-arch == 'Linux (x86_64)' }}
@@ -317,59 +330,7 @@ jobs:
           name: fe_app
           path: fe_app/
           if-no-files-found: error
-
-  download-fiddler-everywhere-mac:
-    if: ${{ github.event.inputs.os-and-arch == 'Mac (x86_64)' || github.event.inputs.os-and-arch == 'Mac (arm64)' || github.event.inputs.os-and-arch == 'Mac (arm64e)' }}
-    runs-on: mac-latest
-    needs: 
-      - scrape_fe_version
-
-    env: 
-      ARCH_CODE: ${{ github.event.inputs.arch_code }}
-
-    steps:
-      - name: Build URL & Download
-        run: |
-          # Retrieve the scraped version from the previous step
-          $scrapedVersion = "${{ needs.scrape_fe_version.outputs.scraped_version }}"
-          
-          # Check if the scraped version is available
-          if (-not [string]::IsNullOrEmpty($scrapedVersion)) {
-            $downloadUrl = "null"
-
-            if ($env:ARCH_CODE -eq "x86_64") {
-              $downloadUrl = "https://downloads.getfiddler.com/mac/Fiddler%20Everywhere%20$scrapedVersion.dmg"
-            } elseif ($env:ARCH_CODE -eq "arm64") {
-              $downloadUrl = "https://downloads.getfiddler.com/mac-arm64/Fiddler%20Everywhere%20$scrapedVersion.dmg"
-            } elseif ($env:ARCH_CODE -eq "arm64e") {
-              //Don't know
-            } else {
-              throw "Unsupported OS architecture: $env:ARCH_CODE"
-            }
-          
-            Write-Host "Download URL: $downloadUrl"
-
-            Invoke-WebRequest -Uri $downloadUrl -OutFile "FiddlerEverywhereSetup.dmg"
-            
-          } else {
-            Write-Host "SCRAPED_VERSION is empty or not set"
-            exit 1
-          }
-
-      - name: Extract Dmg 
-        run: |
-          hdiutil attach FiddlerEverywhere.dmg
-          cp -R /Volumes/FiddlerEverywhere/* ./fe_app/
-
-      - name: List fe_app
-        run: Get-ChildItem -Recurse
-        
-      - name: Upload Fiddler Everywhere Extracted folder as an artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: fe_app
-          path: fe_app/
-          if-no-files-found: error
+          include-hidden-files: true
 
   patch_fe:
     runs-on: windows-latest
@@ -380,8 +341,13 @@ jobs:
       - scrape_fe_version
       - download-fiddler-everywhere-windows
       - download-fiddler-everywhere-linux
-      - download-fiddler-everywhere-mac
-    if: always()
+    if: >-
+      ${{ !cancelled() &&
+          needs.download-Yui-patch.result == 'success' &&
+          needs.download-msojocs-server.result == 'success' &&
+          needs.scrape_fe_version.result == 'success' &&
+          (needs.download-fiddler-everywhere-windows.result == 'success' ||
+           needs.download-fiddler-everywhere-linux.result == 'success') }}
 
     env:
       SCRAPED_VERSION: ${{ needs.scrape_fe_version.outputs.scraped_version }}
@@ -417,16 +383,49 @@ jobs:
       - name: Rename main FE folder
         run: Rename-Item -Path "fe_app" -NewName "FE"
 
+      - name: Set up Node.js for ASAR extraction
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Unpack FE application
+        run: |
+          $asar = "FE/resources/app.asar"
+          $app = "FE/resources/app"
+          $main = "$app/out/main.js"
+
+          if (Test-Path -LiteralPath $asar -PathType Leaf) {
+            # Some installers omit this unpacked notice file referenced by ASAR.
+            $unpacked = "$asar.unpacked"
+            New-Item -ItemType Directory -Path $unpacked -Force | Out-Null
+            $notice = "$unpacked/NOTICES-reporter.txt"
+            if (-not (Test-Path -LiteralPath $notice -PathType Leaf)) {
+              New-Item -ItemType File -Path $notice -Force | Out-Null
+            }
+
+            npx --yes @electron/asar@4.3.1 extract $asar $app
+            if ($LASTEXITCODE -ne 0) {
+              throw "ASAR extraction failed: $asar"
+            }
+            if (-not (Test-Path -LiteralPath $main -PathType Leaf)) {
+              throw "Application entry not found after ASAR extraction: $main"
+            }
+            # Electron must load the extracted app directory when applying changes.
+            Remove-Item -LiteralPath $asar -Force
+          } elseif (-not (Test-Path -LiteralPath $main -PathType Leaf)) {
+            throw "Neither $asar nor $main exists. Check the extracted FE artifact."
+          }
+
       - name: Patch fiddler.dll / libfiddler.dll
         run: |
           $original_fiddler = "FE/${{ needs.download-Yui-patch.outputs.Yui-fiddler-name }}"
           $Yui_fiddler = "Yui-patch/${{ needs.download-Yui-patch.outputs.Yui-fiddler-name }}"
           
           if ((Test-Path $original_fiddler) -and (Test-Path $Yui_fiddler)) {
-            Copy-Item -Path $Yui_fiddler -Destination $original_fiddler -Force
+            Copy-Item -Path $Yui_fiddler -Destination $original_fiddler -Force -ErrorAction Stop
             Write-Host "Replaced $original_fiddler with $Yui_fiddler"
           } else {
-            Write-Host "fiddler / libfiddler or Yui patch not found"
+            throw "Required library not found: $original_fiddler or $Yui_fiddler"
           }
 
       - name: Clean Yui-patch
@@ -440,12 +439,17 @@ jobs:
       - name: Copy Server Folder
         run: |
           $source_server_folder = "msojocs-patch/server/file"
-          $destination_server_folder = "FE/resources/app/out"
+          $destination_server_folder = "FE/resources/app/out/file"
 
-          if (Test-Path $source_server_folder) {
-            Copy-Item -Path $source_server_folder -Destination $destination_server_folder -Recurse
-          } else {
-            Write-Host "Source Server Folder not found"
+          if (-not (Test-Path -LiteralPath $source_server_folder -PathType Container)) {
+            throw "Source server folder not found: $source_server_folder"
+          }
+          New-Item -ItemType Directory -Path $destination_server_folder -Force | Out-Null
+          Copy-Item -Path "$source_server_folder/*" -Destination $destination_server_folder -Recurse -Force -ErrorAction Stop
+
+          $token = "$destination_server_folder/identity.getfiddler.com/oauth/token.json"
+          if (-not (Test-Path -LiteralPath $token -PathType Leaf)) {
+            throw "Required token template not found after copying server resources: $token"
           }
 
       - name: Enable Chinese translation
@@ -455,29 +459,38 @@ jobs:
           $dest_translate = "FE/resources/app/out/translate.js"
 
           if (Test-Path $translate_js) {
-            Copy-Item -Path $translate_js -Destination $dest_translate -Force
+            Copy-Item -Path $translate_js -Destination $dest_translate -Force -ErrorAction Stop
             Write-Host "translate.js copied, Chinese language enabled (Ctrl+T to switch)"
           } else {
-            Write-Host "translate.js not found in server directory"
+            throw "translate.js not found in server directory"
           }
 
       - name: Set patch server port (in main.js of server)
         run: |
           $source_index = "msojocs-patch/server/index.js"
-          $index_content = Get-Content -Path $source_index -Raw
-
-          if (Test-Path $source_index) {
-            $index_content = $index_content -replace 'const port = \d+;', "const port = $env:PATCH_SERVER_PORT;"
-            Set-Content -Path $source_index -Value $index_content
-            Write-Host "Server port set to $env:PATCH_SERVER_PORT"
-          } else {
-            Write-Host "index.js (from server) not found"
+          if (-not (Test-Path -LiteralPath $source_index -PathType Leaf)) {
+            throw "Server entry not found: $source_index"
           }
+          $port = 0
+          if (-not [int]::TryParse($env:PATCH_SERVER_PORT, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+            throw "PATCH_SERVER_PORT must be an integer from 1 to 65535."
+          }
+          $index_content = Get-Content -LiteralPath $source_index -Raw -Encoding utf8
+          $port_pattern = 'const\s+port\s*=\s*\d+\s*;'
+          if ($index_content -notmatch $port_pattern) {
+            throw "Server port declaration not found in $source_index"
+          }
+          $index_content = $index_content -replace $port_pattern, "const port = $port;"
+          Set-Content -LiteralPath $source_index -Value $index_content -Encoding utf8NoBOM -NoNewline
+          Write-Host "Server port set to $port"
 
       - name: Set user credentials
         run: |
           $source_json = "FE/resources/app/out/file/identity.getfiddler.com/oauth/token.json"
-          $main_content = Get-Content -Path $source_json -Raw | ConvertFrom-Json
+          if (-not (Test-Path -LiteralPath $source_json -PathType Leaf)) {
+            throw "Token template not found: $source_json. Check the server resource copy step."
+          }
+          $main_content = Get-Content -LiteralPath $source_json -Raw -Encoding utf8 | ConvertFrom-Json
 
           $main_content.user_info.email = $env:PATCH_USER_EMAIL
           $main_content.user_info.firstName = $env:PATCH_USER_FNAME
@@ -485,27 +498,24 @@ jobs:
           $main_content.user_info.country = $env:PATCH_USER_COUNTRYCODE
           $main_content.user_info.identities[0].providerName = $env:PATCH_USER_PROVIDER
 
-          $main_content | ConvertTo-Json -Depth 5 | Set-Content -Path $source_json
+          $main_content | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $source_json -Encoding utf8NoBOM
 
       - name: Patch main.js to main.original.js
         run: |
           $source_main = "FE/resources/app/out/main.js"
-          $main_content = Get-Content -Path $source_main -Raw
-
           $new_main = "FE/resources/app/out/main.original.js"
-
           $source_index = "msojocs-patch/server/index.js"
-          $index_content = Get-Content -Path $source_index -Raw
-          
-          if ((Test-Path $source_main) -and (Test-Path $source_index)) {
-            Copy-Item -Path $source_main -Destination $new_main
 
-            $appended_content = $index_content + $main_content
-
-            Set-Content -Path $source_main -Value $appended_content
-          } else {
-            Write-Host "Source main.js or index.js (from server) not found"
+          foreach ($path in @($source_main, $source_index)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Required JavaScript entry not found: $path"
+            }
           }
+          $main_content = Get-Content -LiteralPath $source_main -Raw -Encoding utf8
+          $index_content = Get-Content -LiteralPath $source_index -Raw -Encoding utf8
+          Copy-Item -LiteralPath $source_main -Destination $new_main -Force -ErrorAction Stop
+          $appended_content = $index_content + [Environment]::NewLine + $main_content
+          Set-Content -LiteralPath $source_main -Value $appended_content -Encoding utf8NoBOM -NoNewline
 
       - name: Clean msojocs-patch
         run: |
@@ -534,3 +544,4 @@ jobs:
           name: "${{ steps.rename-fe.outputs.patched-fe-name }}"
           path: "${{ steps.rename-fe.outputs.patched-fe-name }}/"
           if-no-files-found: error
+          include-hidden-files: true
